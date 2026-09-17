@@ -1,6 +1,11 @@
 using System.Text.Json;
 using FanControlCore.Discovery;
 
+// 出去的 JSON 一律 camelCase。
+// 这是对外的接口，字段名是合同的一部分 —— 让它随 C# 属性名走，
+// 改个属性名就会悄悄改掉合同，而调用方要等到运行时才发现。
+var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+
 // 标准输入一行一条请求，标准输出一行一条应答。
 // 父进程关掉标准输入，这个进程就结束 —— 而且**走之前把风扇交还固件**。
 using var core = new FanCore();
@@ -23,7 +28,7 @@ while ((line = Console.ReadLine()) is not null)
     {
         continue;
     }
-    Console.WriteLine(JsonSerializer.Serialize(Handle(core, line)));
+    Console.WriteLine(JsonSerializer.Serialize(Handle(core, line), jsonOptions));
     Console.Out.Flush();
 }
 
