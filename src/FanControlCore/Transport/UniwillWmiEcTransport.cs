@@ -47,12 +47,13 @@ public sealed class UniwillWmiEcTransport : IDisposable
 
     private readonly object gate = new();
     private readonly EcChannelLock channel = new(ChannelName);
-    private ManagementObject? device;
-    private bool probed;
+    // 找设备、发方法、设备失效之后重新解析 —— 那些是所有 WMI 通道共同的事。
+    // 这条通道自己负责的只有 EC 那套参数编码。
+    private readonly WmiMethodChannel wmi = new(Scope, ClassName, InstanceName);
     private bool disposed;
 
     /// <summary>这台机器有没有这条通道。</summary>
-    public bool IsAvailable => ResolveDevice() is not null;
+    public bool IsAvailable => wmi.IsAvailable;
 
     /// <summary>读一个 EC 字节。读到连续一致的值才返回，否则 null。</summary>
     public byte? Read(ushort address)
@@ -179,60 +180,18 @@ public sealed class UniwillWmiEcTransport : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// 发一条 EC 命令。<c>0xFEFEFEFE</c> 是这个固件说"这条我不认"的方式 ——
+    /// 它对别的一切都返回成功，所以只有这一个码能当失败看。
+    /// </summary>
     private uint? Invoke(ulong data)
-    {
-        if (ResolveDevice() is not { } target)
-        {
-            return null;
-        }
-        try
-        {
-            using var parameters = target.GetMethodParameters(MethodName);
-            parameters["Data"] = data;
-            using var result = target.InvokeMethod(MethodName, parameters, null);
-            return result?["Return"] is uint returned && returned != CallFailed ? returned : null;
-        }
-        catch (Exception error) when (error is ManagementException or UnauthorizedAccessException)
-        {
-            // 接口可能刚刚消失（驱动被停用），下次重新解析。
-            lock (gate)
-            {
-                device?.Dispose();
-                device = null;
-                probed = false;
-            }
-            return null;
-        }
-    }
-
-    private ManagementObject? ResolveDevice()
-    {
-        lock (gate)
-        {
-            if (probed)
-            {
-                return device;
-            }
-            probed = true;
-            try
-            {
-                using var searcher = new ManagementObjectSearcher(
-                    Scope,
-                    $"SELECT * FROM {ClassName} WHERE InstanceName = '{InstanceName.Replace(@"\", @"\\")}'");
-                foreach (var found in searcher.Get())
-                {
-                    device = (ManagementObject)found;
-                    return device;
-                }
-            }
-            catch (Exception error) when (error is ManagementException
-                or UnauthorizedAccessException)
-            {
-                // 没有这条通道，或者没有管理员权限。两者都归"用不了"。
-            }
-            return device;
-        }
-    }
+        => wmi.Invoke(MethodName, new Dictionary<string, object?> { ["Data"] = data })
+            is { } result
+            && result.TryGetValue("Return", out var returned)
+            && returned is uint value
+            && value != CallFailed
+                ? value
+                : null;
 
     public void Dispose()
     {
@@ -241,11 +200,7 @@ public sealed class UniwillWmiEcTransport : IDisposable
             return;
         }
         disposed = true;
-        lock (gate)
-        {
-            device?.Dispose();
-            device = null;
-        }
+        wmi.Dispose();
         channel.Dispose();
     }
 }
