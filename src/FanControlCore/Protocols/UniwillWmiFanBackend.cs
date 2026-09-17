@@ -54,6 +54,16 @@ public sealed class UniwillWmiFanBackend : IFanBackend
         return true;
     }
 
+    /// <summary>
+    /// 两个风扇，能力都由固件指纹决定，不碰 EC。
+    /// <c>supportsDuty</c> 在这个固件上恒为 false，原因见 <see cref="TrySetDuty"/>。
+    /// </summary>
+    public IReadOnlyList<FanDescription> Describe() =>
+    [
+        new FanDescription(0, "主风扇", writable, SupportsDuty: false),
+        new FanDescription(1, "副风扇", writable, SupportsDuty: false)
+    ];
+
     public IReadOnlyList<FanState> Read()
     {
         var mode = transport.Read(UniwillFanProfileTable.FanModeRegister);

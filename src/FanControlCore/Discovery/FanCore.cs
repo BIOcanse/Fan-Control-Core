@@ -75,6 +75,10 @@ public sealed class FanCore : IDisposable
         return false;
     }
 
+    /// <summary>有几个风扇、各自能做什么。不碰硬件。</summary>
+    public IReadOnlyList<FanDescription> Describe()
+        => active?.Describe() ?? [];
+
     public IReadOnlyList<FanState> Read()
         => active?.Read() ?? [];
 

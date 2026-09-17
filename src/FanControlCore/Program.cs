@@ -52,7 +52,9 @@ static Dictionary<string, object?> Handle(FanCore core, string line)
                     ["available"] = core.ActiveBackendName is not null,
                     ["backend"] = core.ActiveBackendName,
                     ["reason"] = core.UnavailableReason,
-                    ["fans"] = core.Read()
+                    // **能做什么**，不是现在多少。describe 不碰硬件，
+                    // 所以调用方画界面时可以随便问 —— 转速请走 read。
+                    ["fans"] = core.Describe()
                 });
 
             case "read":
