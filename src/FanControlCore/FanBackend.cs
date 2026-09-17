@@ -31,6 +31,29 @@ public sealed record FanState(
     bool AutomaticControl);
 
 /// <summary>
+/// 一个风扇**能做什么**。
+///
+/// 和 <see cref="FanState"/> 的区别是**变不变**：这里的每一项都由通道和机型决定，
+/// 开机之后不会变；转速和现在归谁管是"此刻多少"，那是 <see cref="FanState"/> 的事。
+///
+/// 分开是有代价原因的：问"能不能设曲线"不该去读一遍 EC。
+/// EC 每读一个字节要十几次固件往返，而调用方光是画一次界面就会问好几遍 ——
+/// 实测把这两件事混在一起之后，列一次可控对象要十几秒。
+/// </summary>
+public sealed record FanDescription(
+    int Index,
+    string Name,
+    /// <summary>能不能写。只读的风扇照样列出来，用户要看得见它存在。</summary>
+    bool Writable,
+    /// <summary>
+    /// 能不能给任意占空比。
+    ///
+    /// **有的通道只有"全速"和"自动"两档**（Uniwill 的全速模式位就是这样）。
+    /// 那种通道上不该假装能设 70% —— 收到 70% 就给 100%，是在骗用户。
+    /// </summary>
+    bool SupportsDuty);
+
+/// <summary>
 /// 一条风扇控制通道。
 ///
 /// **后端只回答"这台机器上这条通道能做什么"，不做策略。**
@@ -48,6 +71,11 @@ public interface IFanBackend : IDisposable
     /// 用不了要说为什么 —— "认不出这台机器"和"没有权限"对用户是完全不同的两件事。
     /// </summary>
     bool TryOpen(out string? unavailableReason);
+
+    /// <summary>
+    /// 这条通道上有几个风扇、各自能做什么。**不碰硬件** —— 这些在开通道那一刻就定了。
+    /// </summary>
+    IReadOnlyList<FanDescription> Describe();
 
     /// <summary>现在有几个风扇、各自什么状态。</summary>
     IReadOnlyList<FanState> Read();

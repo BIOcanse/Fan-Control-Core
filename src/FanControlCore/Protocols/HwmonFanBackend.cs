@@ -67,6 +67,22 @@ public sealed class HwmonFanBackend : IFanBackend
         return true;
     }
 
+    /// <summary>
+    /// hwmon 下每个风扇能做什么，由扫描时找到的那几个文件决定 —— 只看路径，不读文件。
+    /// pwm 可写就意味着任意占空比：它本来就是个 0-255 的数。
+    /// </summary>
+    public IReadOnlyList<FanDescription> Describe()
+    {
+        var descriptions = new List<FanDescription>(fans.Count);
+        for (var index = 0; index < fans.Count; index++)
+        {
+            var fan = fans[index];
+            var writable = fan.DutyPath is not null && CanWrite(fan.DutyPath);
+            descriptions.Add(new FanDescription(index, fan.Name, writable, writable));
+        }
+        return descriptions;
+    }
+
     public IReadOnlyList<FanState> Read()
     {
         var states = new List<FanState>(fans.Count);
