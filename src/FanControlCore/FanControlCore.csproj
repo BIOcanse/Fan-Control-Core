@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>FanControlCore</AssemblyName>
+    <RootNamespace>FanControlCore</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- 跨平台：Linux 走 hwmon，Windows 走 WMI/ACPI/EC。不锁死运行时标识。 -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Windows 那条通道要 WMI。Linux 上这个包在则不用，运行时按平台分流。 -->
+    <PackageReference Include="System.Management" Version="10.0.2" />
+  </ItemGroup>
+
+</Project>
