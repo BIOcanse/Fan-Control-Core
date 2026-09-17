@@ -26,8 +26,10 @@ public sealed class WmiMethodChannel : IDisposable
     /// </summary>
     private readonly object gate = new();
     private readonly string scope;
-    private readonly string className;
+    private readonly string? declaredClassName;
+    private readonly string? classGuid;
     private readonly string? instanceName;
+    private string? resolvedClassName;
     private ManagementObject? device;
     private bool probed;
     private bool disposed;
@@ -37,9 +39,32 @@ public sealed class WmiMethodChannel : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(scope);
         ArgumentException.ThrowIfNullOrWhiteSpace(className);
         this.scope = scope;
-        this.className = className;
+        declaredClassName = className;
         this.instanceName = instanceName;
     }
+
+    private WmiMethodChannel(string scope, string classGuid, bool byGuid)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(scope);
+        ArgumentException.ThrowIfNullOrWhiteSpace(classGuid);
+        this.scope = scope;
+        this.classGuid = classGuid.Trim('{', '}');
+        _ = byGuid;
+    }
+
+    /// <summary>
+    /// 按 **GUID** 找一条厂商接口。
+    ///
+    /// 上游的实现（内核驱动、各家的开源工具）一律用 GUID 指认一个厂商接口，
+    /// 因为那是固件里写死的东西。Windows 上那个 GUID 落成 <c>root\WMI</c> 里的一个类，
+    /// **类名只是本地别名**，各机型、各驱动版本都可能不一样 ——
+    /// 按类名找就等于在猜一个我们没有机器去核对的名字。
+    ///
+    /// 所以按 GUID 找：遍历一次这个 scope 的类定义，读每个类的 WMI <c>guid</c> 限定符。
+    /// 遍历只在第一次用到时做一次。
+    /// </summary>
+    public static WmiMethodChannel ForGuid(string scope, string classGuid)
+        => new(scope, classGuid, byGuid: true);
 
     /// <summary>这台机器上有没有这个类的实例。没有就是没有这条通道。</summary>
     public bool IsAvailable => Resolve() is not null;
@@ -104,7 +129,7 @@ public sealed class WmiMethodChannel : IDisposable
     /// 没有那些机器。所以这里按 WMI 自己记录的参数序号（<c>ID</c> 限定符）填，
     /// 名字是什么都不用管。
     /// </summary>
-    public uint? InvokeOrdered(string methodName, params uint[] arguments)
+    public ulong? InvokeOrdered(string methodName, params ulong[] arguments)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(methodName);
         ArgumentNullException.ThrowIfNull(arguments);
@@ -125,7 +150,7 @@ public sealed class WmiMethodChannel : IDisposable
                 }
                 for (var index = 0; index < arguments.Length; index++)
                 {
-                    parameters[ordered[index]] = arguments[index];
+                    parameters[ordered[index]] = Fit(parameters, ordered[index], arguments[index]);
                 }
                 using var result = target.InvokeMethod(methodName, parameters, null);
                 return FirstUnsignedValue(result);
@@ -137,6 +162,62 @@ public sealed class WmiMethodChannel : IDisposable
                 Forget();
                 return null;
             }
+        }
+    }
+
+    /// <summary>
+    /// 按 **WMI 方法 ID** 调一次方法。
+    ///
+    /// 有的厂商（Acer 就是）的接口在上游一律用方法 ID 指认
+    /// —— 那是固件里写死的编号；Windows 上这些方法的**名字是本地别名**，
+    /// 各驱动版本可能不一样。所以按 MOF 里的 <c>WmiMethodId</c> 限定符找那个方法。
+    /// </summary>
+    public ulong? InvokeOrderedByMethodId(int methodId, params ulong[] arguments)
+        => MethodNameById(methodId) is { } name ? InvokeOrdered(name, arguments) : null;
+
+    /// <summary>这个类里 <c>WmiMethodId</c> 等于这个编号的方法叫什么。找不到就是没有。</summary>
+    private string? MethodNameById(int methodId)
+    {
+        lock (gate)
+        {
+            // 先把类名定下来：按 GUID 找的通道要等这一步之后才知道自己是哪个类。
+            if (Resolve() is null || resolvedClassName is null)
+            {
+                return null;
+            }
+            try
+            {
+                using var definition = new ManagementClass(
+                    new ManagementScope(scope),
+                    new ManagementPath(resolvedClassName),
+                    null);
+                foreach (var method in definition.Methods)
+                {
+                    try
+                    {
+                        if (method.Qualifiers["WmiMethodId"]?.Value is { } id
+                            && Convert.ToInt32(
+                                id,
+                                System.Globalization.CultureInfo.InvariantCulture) == methodId)
+                        {
+                            return method.Name;
+                        }
+                    }
+                    catch (Exception error) when (error is ManagementException
+                        or FormatException
+                        or InvalidCastException
+                        or OverflowException)
+                    {
+                        // 这个方法没有编号限定符，看下一个。
+                    }
+                }
+            }
+            catch (Exception error) when (error is ManagementException
+                or UnauthorizedAccessException)
+            {
+                // 读不了类定义。当作没有这个方法。
+            }
+            return null;
         }
     }
 
@@ -221,6 +302,38 @@ public sealed class WmiMethodChannel : IDisposable
         return null;
     }
 
+    /// <summary>
+    /// 把一个整数装进这个参数**声明的类型**里。
+    ///
+    /// 各家的参数宽度不一样：ASUS 收 uint32，联想的风扇号收的是一个字节。
+    /// 一律按 uint32 塞进去，宽度对不上的那家会在真机上被 WMI 拒掉 ——
+    /// 而那正是我们没有机器去发现的那类错误。所以按 WMI 自己声明的类型转。
+    /// 装不下就原样交出去，让 WMI 去报错，不在这里悄悄截断。
+    /// </summary>
+    private static object Fit(ManagementBaseObject parameters, string name, ulong value)
+    {
+        try
+        {
+            return parameters.Properties[name].Type switch
+            {
+                CimType.UInt8 when value <= byte.MaxValue => (byte)value,
+                CimType.SInt8 when value <= (ulong)sbyte.MaxValue => (sbyte)value,
+                CimType.UInt16 when value <= ushort.MaxValue => (ushort)value,
+                CimType.SInt16 when value <= (ulong)short.MaxValue => (short)value,
+                CimType.UInt32 when value <= uint.MaxValue => (uint)value,
+                CimType.SInt32 when value <= int.MaxValue => (int)value,
+                CimType.SInt64 when value <= long.MaxValue => (long)value,
+                CimType.UInt64 => value,
+                _ when value <= uint.MaxValue => (uint)value,
+                _ => value
+            };
+        }
+        catch (ManagementException)
+        {
+            return value;
+        }
+    }
+
     /// <summary>入参按 WMI 记录的序号排好。序号缺失的排在后面，顺序稳定。</summary>
     private static List<string> InParametersByPosition(ManagementBaseObject parameters)
     {
@@ -247,7 +360,7 @@ public sealed class WmiMethodChannel : IDisposable
         return ordered.ConvertAll((entry) => entry.Name);
     }
 
-    private static uint? FirstUnsignedValue(ManagementBaseObject? result)
+    private static ulong? FirstUnsignedValue(ManagementBaseObject? result)
     {
         if (result is null)
         {
@@ -261,7 +374,7 @@ public sealed class WmiMethodChannel : IDisposable
             }
             try
             {
-                return Convert.ToUInt32(
+                return Convert.ToUInt64(
                     property.Value,
                     System.Globalization.CultureInfo.InvariantCulture);
             }
@@ -284,11 +397,16 @@ public sealed class WmiMethodChannel : IDisposable
                 return device;
             }
             probed = true;
+            resolvedClassName = declaredClassName ?? FindClassByGuid();
+            if (resolvedClassName is null)
+            {
+                return null;
+            }
             try
             {
                 var query = instanceName is null
-                    ? $"SELECT * FROM {className}"
-                    : $"SELECT * FROM {className} WHERE InstanceName = "
+                    ? $"SELECT * FROM {resolvedClassName}"
+                    : $"SELECT * FROM {resolvedClassName} WHERE InstanceName = "
                         + $"'{instanceName.Replace(@"\", @"\\")}'";
                 using var searcher = new ManagementObjectSearcher(scope, query);
                 foreach (var found in searcher.Get())
@@ -303,6 +421,69 @@ public sealed class WmiMethodChannel : IDisposable
                 // 没有这条通道，或者没有管理员权限。两者都归"用不了"。
             }
             return device;
+        }
+    }
+
+    /// <summary>
+    /// 一个 scope 里 GUID 到类名的对照表，**整个进程只建一次**。
+    ///
+    /// 建一次要把这个 scope 的类定义全过一遍，本机实测 892 个类、1.5 秒。
+    /// 每条厂商通道各扫一遍就是好几秒，而这台机器上它们绝大多数都不在 ——
+    /// 为找不到的东西花几秒，是用户能直接感觉到的那种慢。
+    /// </summary>
+    private static readonly Dictionary<string, IReadOnlyDictionary<string, string>> GuidMaps =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly object GuidMapGate = new();
+
+    /// <summary>
+    /// 在这个 scope 里找 WMI <c>guid</c> 限定符等于 <see cref="classGuid"/> 的那个类。
+    /// 找不到就是这台机器上没有这个厂商接口。
+    /// </summary>
+    private string? FindClassByGuid()
+        => classGuid is not null
+            && GuidMapOf(scope).TryGetValue(classGuid, out var found)
+                ? found
+                : null;
+
+    private static IReadOnlyDictionary<string, string> GuidMapOf(string scope)
+    {
+        lock (GuidMapGate)
+        {
+            if (GuidMaps.TryGetValue(scope, out var cached))
+            {
+                return cached;
+            }
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using var searcher = new ManagementObjectSearcher(
+                    new ManagementScope(scope),
+                    new WqlObjectQuery("SELECT * FROM meta_class"),
+                    new System.Management.EnumerationOptions { EnumerateDeep = false });
+                foreach (var found in searcher.Get())
+                {
+                    using var definition = found;
+                    try
+                    {
+                        if (definition.Qualifiers["guid"]?.Value is string guid)
+                        {
+                            map[guid.Trim('{', '}')] = definition.ClassPath.ClassName;
+                        }
+                    }
+                    catch (ManagementException)
+                    {
+                        // 这个类没有 guid 限定符 —— 不是厂商的 WMI 数据块，跳过。
+                    }
+                }
+            }
+            catch (Exception error) when (error is ManagementException
+                or UnauthorizedAccessException)
+            {
+                // 列不了类：没有权限，或者这个 scope 根本不在。空表就是"一个都没找到"。
+            }
+            GuidMaps[scope] = map;
+            return map;
         }
     }
 
