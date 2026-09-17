@@ -37,8 +37,12 @@ public sealed class FanCore : IDisposable
         }
         if (OperatingSystem.IsWindows())
         {
-            // 同方公版（Uniwill/Tongfang，机械革命等都是这一族）走厂商固件的
-            // ACPI WMI 接口 —— 是固件自己的接口，不是我们直接捅 EC 端口。
+            // 先厂商 WMI/ACPI，后 Raw EC —— 固件自己的接口是厂商在维护的，
+            // 而 EC 寄存器表是我们照着别人逆出来的结果在用。
+            candidates.Add(new AsusWmiFanBackend());
+            candidates.Add(new HpWmiFanBackend());
+            // 同方公版（Uniwill/Tongfang，机械革命等都是这一族）读写的仍然是 EC 寄存器，
+            // 只是借道固件的 ACPI WMI 方法，所以按 Raw EC 的规矩办：认不出就只读。
             candidates.Add(new UniwillWmiFanBackend());
         }
     }
