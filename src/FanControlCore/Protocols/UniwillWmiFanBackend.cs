@@ -14,6 +14,8 @@ namespace FanControlCore.Protocols;
 /// <item>写之前必须过固件指纹检查（<see cref="UniwillFanProfileTable.IsSupported"/>）——
 ///   固件自己说有风扇控制，我们才写。认不出的机器**只读**。</item>
 /// <item>占空比夹在 profile 声明的范围里，而且不允许落进"转不起来"的那一段。</item>
+/// <item>任意占空比走自定义风扇表（见 <see cref="UniwillFanTable"/>），
+///   它自带一条安全网：温度冲过可控上界时固件会自己拉满速。</item>
 /// <item>退出时清掉全速模式位，交还固件 —— 由核心统一调。</item>
 /// </list>
 /// </summary>
@@ -22,6 +24,8 @@ public sealed class UniwillWmiFanBackend : IFanBackend
 {
     private readonly UniwillWmiEcTransport transport = new();
     private bool writable;
+    /// <summary>自定义风扇表建好了没有。建一次就够，之后只改 0 区的转速。</summary>
+    private bool tablesPrepared;
 
     public string Name => "uniwill-wmi-ec";
 
@@ -77,14 +81,23 @@ public sealed class UniwillWmiFanBackend : IFanBackend
     }
 
     /// <summary>
-    /// **这条通道给不了任意占空比。**
+    /// **这个固件上给不了任意占空比，实测关掉了。**
     ///
-    /// <c>0x0751</c> 的那一位在固件里叫"全速模式"，字面意思就是全速：
-    /// 置位之后两个风扇都拉满，写多少占空比它都不看。实测要 70% 得到的是 100%。
-    /// 真正的任意占空比要走自定义风扇表（<c>0x0F20</c>/<c>0x0F50</c> 加
-    /// <c>0x07C5</c>/<c>0x07C6</c> 的使能位），那是另一套，还没做。
+    /// 自定义风扇表那条路（<see cref="UniwillFanTable"/>）在参考实现里是对的，
+    /// 但这台机器的固件不这么配合，实测踩到两个坑：
     ///
-    /// 所以这里如实拒绝 —— 收到 70% 就给 100%，是在骗用户。
+    /// <list type="number">
+    /// <item><c>0x07C5</c>（分表使能）写不进去，固件拒绝。</item>
+    /// <item>更糟的是它**只能置位不能清位**：试写之后 bit7 从 0 变成 1，
+    ///   之后无论怎么写都清不掉。也就是说这条路会把机器推进一个我们出不来的状态。</item>
+    /// </list>
+    ///
+    /// 建表过程中副风扇一度被留在 25% 占空比 —— 比固件自己给的还低。
+    /// **一条自己走不回来的路不能留给用户走**，所以这里直接拒绝，
+    /// 把 <c>supportsDuty</c> 报成 false，只保留实测可用的全速与自动两档。
+    ///
+    /// 建表的代码留着（它照参考实现写，在固件配合的机器上应当可用），
+    /// 等遇到那样的机器、并且验证过"能清位"之后再打开。
     /// </summary>
     public bool TrySetDuty(int fanIndex, double percent, out string? failureReason)
     {
@@ -92,9 +105,117 @@ public sealed class UniwillWmiFanBackend : IFanBackend
         {
             return false;
         }
-        failureReason = "这条通道只有全速和自动两档，给不了任意占空比。";
+        failureReason = "这台机器的固件不接受自定义风扇表，只有全速和自动两档。";
         return false;
     }
+
+    /// <summary>
+    /// 把自定义风扇表摆好：0 区是可控区，1–15 区是永远到不了的哑区、里面填满速。
+    ///
+    /// 建表之前先关掉全速模式 —— 那两条路互斥，全速模式开着的时候固件不查表。
+    /// </summary>
+    private bool EnsureTables(out string? failureReason)
+    {
+        if (tablesPrepared)
+        {
+            failureReason = null;
+            return true;
+        }
+
+        if (!ClearFullFanMode(out failureReason))
+        {
+            return false;
+        }
+        if (!SetBit(
+                UniwillFanTable.SeparateTablesRegister,
+                UniwillFanTable.SeparateTablesBit,
+                out failureReason))
+        {
+            return false;
+        }
+
+        for (var fanIndex = 0; fanIndex < 2; fanIndex++)
+        {
+            var (endBase, startBase, speedBase) = UniwillFanTable.AddressesFor(fanIndex);
+            // 0 区：从 0 度一直管到可控上界，转速待会儿再填真值。
+            if (!transport.WriteWithRetry(
+                    endBase,
+                    UniwillFanTable.ControllableUpToCelsius(fanIndex))
+                || !transport.WriteWithRetry(startBase, 0)
+                || !transport.WriteWithRetry(speedBase, UniwillFanTable.InitialZoneSpeed))
+            {
+                failureReason = "建风扇表失败（可控区）。";
+                return false;
+            }
+            // 1–15 区：116-117、117-118…… 到不了，而且一律满速当安全网。
+            for (var zone = 1; zone < UniwillFanTable.ZoneCount; zone++)
+            {
+                var start = (byte)(UniwillFanTable.DummyZoneBaseCelsius + zone);
+                if (!transport.WriteWithRetry((ushort)(endBase + zone), (byte)(start + 1))
+                    || !transport.WriteWithRetry((ushort)(startBase + zone), start)
+                    || !transport.WriteWithRetry(
+                        (ushort)(speedBase + zone),
+                        UniwillFanTable.DummyZoneSpeed))
+                {
+                    failureReason = "建风扇表失败（哑区）。";
+                    return false;
+                }
+            }
+        }
+
+        // 最后才打开"用自定义表"这一位 —— 表还没填完就打开，固件会按半张表跑。
+        if (!SetBit(
+                UniwillFanTable.UseCustomTablesRegister,
+                UniwillFanTable.UseCustomTablesBit,
+                out failureReason))
+        {
+            return false;
+        }
+
+        tablesPrepared = true;
+        failureReason = null;
+        return true;
+    }
+
+    private bool SetBit(ushort address, byte bit, out string? failureReason)
+    {
+        if (transport.Read(address) is not { } current)
+        {
+            failureReason = $"读不到 0x{address:X4}。";
+            return false;
+        }
+        var wanted = (byte)(current | bit);
+        if (current != wanted && !transport.WriteWithRetry(address, wanted))
+        {
+            failureReason = $"写不了 0x{address:X4}。";
+            return false;
+        }
+        failureReason = null;
+        return true;
+    }
+
+    private bool ClearBit(ushort address, byte bit, out string? failureReason)
+    {
+        if (transport.Read(address) is not { } current)
+        {
+            failureReason = $"读不到 0x{address:X4}。";
+            return false;
+        }
+        var wanted = (byte)(current & ~bit);
+        if (current != wanted && !transport.WriteWithRetry(address, wanted))
+        {
+            failureReason = $"写不了 0x{address:X4}。";
+            return false;
+        }
+        failureReason = null;
+        return true;
+    }
+
+    private bool ClearFullFanMode(out string? failureReason)
+        => ClearBit(
+            UniwillFanProfileTable.FanModeRegister,
+            UniwillFanProfileTable.FullFanModeBit,
+            out failureReason);
 
     /// <summary>全速。置上那一位，两个风扇一起拉满 —— 这个位是整机共用的。</summary>
     public bool TrySetFullSpeed(int fanIndex, out string? failureReason)
@@ -130,14 +251,27 @@ public sealed class UniwillWmiFanBackend : IFanBackend
             return false;
         }
 
-        // 清掉全速模式位就是交还固件。**这个位是整机共用的**，
-        // 所以清掉之后两个风扇一起回到自动 —— 这正是我们想要的收摊行为。
+        // 清掉全速模式位。**这个位是整机共用的**，所以两个风扇一起回到自动。
         var wanted = (byte)(mode & ~UniwillFanProfileTable.FullFanModeBit);
         if (mode != wanted && !transport.Write(UniwillFanProfileTable.FanModeRegister, wanted))
         {
             failureReason = "交还固件自动控制失败。";
             return false;
         }
+
+        // 关掉自定义表。**只关"用自定义表"这一位就够** ——
+        // 分表那一位（0x07C5 bit7）在这个固件上清不掉，去写它只会得到一次假失败，
+        // 而真正决定固件用不用自定义表的是这一位。
+        if (!ClearBit(
+                UniwillFanTable.UseCustomTablesRegister,
+                UniwillFanTable.UseCustomTablesBit,
+                out failureReason))
+        {
+            return false;
+        }
+
+        // 下次再设占空比要重新建表：固件自己可能已经把表改回去了。
+        tablesPrepared = false;
         failureReason = null;
         return true;
     }
@@ -188,7 +322,7 @@ public sealed class UniwillWmiFanBackend : IFanBackend
             duty is null ? null : UniwillFanProfileTable.PercentFromDuty(duty.Value),
             duty,
             writable,
-            // 只有全速和自动两档，见 TrySetDuty 上的说明。
+            // 见 TrySetDuty 上那段：这个固件上只有全速和自动。
             SupportsDuty: false,
             automatic);
     }

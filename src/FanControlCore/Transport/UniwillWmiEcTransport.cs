@@ -106,6 +106,25 @@ public sealed class UniwillWmiEcTransport : IDisposable
         return Read(address) == value;
     }
 
+    /// <summary>
+    /// 写一个 EC 字节，写不进就重试。
+    ///
+    /// 风扇表那一段（0x0F00 起）的写入**本来就会偶发失败** —— 固件自己也在动它，
+    /// 参考实现对这一段同样是带重试写的。单次写加回读会稳定地失败在半路，
+    /// 而失败在半路比失败得干脆更糟：表已经改了一半。
+    /// </summary>
+    public bool WriteWithRetry(ushort address, byte value, int attempts = 3)
+    {
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            if (Write(address, value))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private uint? Invoke(ulong data)
     {
         if (ResolveDevice() is not { } target)
