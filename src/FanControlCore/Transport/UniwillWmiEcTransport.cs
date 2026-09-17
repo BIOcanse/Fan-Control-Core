@@ -39,7 +39,14 @@ public sealed class UniwillWmiEcTransport : IDisposable
     private const int AgreeingReads = 3;
     private const int ReadAttempts = 6;
 
+    /// <summary>
+    /// 这条通道的名字。同一台机器上任何用这条 ACPI WMI 接口的进程都该用它
+    /// —— 包括宿主程序自己直接读 EC 的那部分。名字变了就等于没有锁。
+    /// </summary>
+    public const string ChannelName = "Uniwill-AcpiWmi-EcChannel";
+
     private readonly object gate = new();
+    private readonly EcChannelLock channel = new(ChannelName);
     private ManagementObject? device;
     private bool probed;
     private bool disposed;
@@ -49,6 +56,9 @@ public sealed class UniwillWmiEcTransport : IDisposable
 
     /// <summary>读一个 EC 字节。读到连续一致的值才返回，否则 null。</summary>
     public byte? Read(ushort address)
+        => channel.Hold(() => ReadHeld(address), out var value) ? value : null;
+
+    private byte? ReadHeld(ushort address)
     {
         lock (gate)
         {
@@ -83,8 +93,13 @@ public sealed class UniwillWmiEcTransport : IDisposable
     /// 读两个相邻字节拼成的 16 位**大端**值。转速就是这么存的：低地址放高字节。
     /// </summary>
     public int? ReadBigEndianWord(ushort highAddress, ushort lowAddress)
-        => Read(highAddress) is { } high && Read(lowAddress) is { } low
-            ? (high << 8) | low
+        => channel.Hold(
+            // 两个字节要在同一次独占里读完，否则中间被别人插进去就读到半新半旧的转速。
+            () => ReadHeld(highAddress) is { } high && ReadHeld(lowAddress) is { } low
+                ? (high << 8) | low
+                : (int?)null,
+            out var value)
+            ? value
             : null;
 
     /// <summary>
@@ -93,17 +108,56 @@ public sealed class UniwillWmiEcTransport : IDisposable
     /// 这个固件接口对任何调用都返回成功，所以"写成功"只能由回读来定义。
     /// </summary>
     public bool Write(ushort address, byte value)
+        // 写和回读之间不能松手：松手了回读到的可能是别人写进去的。
+        => channel.Hold(
+            () => SendWrite(address, value) && ReadHeld(address) == value,
+            out var written) && written;
+
+    /// <summary>
+    /// 改一个 EC 寄存器里的**一位**，其余位保持固件当时的值。
+    ///
+    /// 和 <see cref="Write"/> 的区别在于**核对什么**。这类寄存器是和固件共用的，
+    /// 固件随时会动里面别的位；整字节回读相等会因为别人改了别的位而判成失败。
+    /// 实测就撞到过：把风扇交还固件时偶发报一次失败，而风扇那时正停在全速上 ——
+    /// 位其实已经清掉了，只是同一个字节里另一位跟着变了。所以这里只核对那一位。
+    /// </summary>
+    public bool WriteBit(ushort address, byte bit, bool set, int attempts = 3)
+        => channel.Hold(() => WriteBitHeld(address, bit, set, attempts), out var written)
+            && written;
+
+    private bool WriteBitHeld(ushort address, byte bit, bool set, int attempts)
+    {
+        var attempt = 0;
+        while (attempt < attempts)
+        {
+            attempt++;
+            if (ReadHeld(address) is not { } current)
+            {
+                continue;
+            }
+            var wanted = set ? (byte)(current | bit) : (byte)(current & ~bit);
+            if (current == wanted)
+            {
+                return true;
+            }
+            if (SendWrite(address, wanted)
+                && ReadHeld(address) is { } after
+                && ((after & bit) != 0) == set)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private bool SendWrite(ushort address, byte value)
     {
         lock (gate)
         {
-            if (Invoke((ulong)address
+            return Invoke((ulong)address
                 | ((ulong)value << 16)
-                | (FunctionWrite << FunctionBitShift)) is null)
-            {
-                return false;
-            }
+                | (FunctionWrite << FunctionBitShift)) is not null;
         }
-        return Read(address) == value;
     }
 
     /// <summary>
@@ -192,5 +246,6 @@ public sealed class UniwillWmiEcTransport : IDisposable
             device?.Dispose();
             device = null;
         }
+        channel.Dispose();
     }
 }
