@@ -30,20 +30,12 @@ public sealed class FanCore : IDisposable
 
     public FanCore()
     {
-        // 顺序即优先级。
-        if (OperatingSystem.IsLinux())
+        // **一级路由**：按平台筛，按通道类别排。这一步只看这台机器是什么系统，
+        // 不碰任何硬件 —— 碰硬件是二级路由（各后端的识别依据）的事。
+        var platform = OperatingSystem.IsLinux() ? FanPlatform.Linux : FanPlatform.Windows;
+        foreach (var route in FanChannelRoute.For(platform))
         {
-            candidates.Add(new HwmonFanBackend());
-        }
-        if (OperatingSystem.IsWindows())
-        {
-            // 先厂商 WMI/ACPI，后 Raw EC —— 固件自己的接口是厂商在维护的，
-            // 而 EC 寄存器表是我们照着别人逆出来的结果在用。
-            candidates.Add(new AsusWmiFanBackend());
-            candidates.Add(new HpWmiFanBackend());
-            // 同方公版（Uniwill/Tongfang，机械革命等都是这一族）读写的仍然是 EC 寄存器，
-            // 只是借道固件的 ACPI WMI 方法，所以按 Raw EC 的规矩办：认不出就只读。
-            candidates.Add(new UniwillWmiFanBackend());
+            candidates.Add(route.Create());
         }
     }
 
@@ -53,7 +45,13 @@ public sealed class FanCore : IDisposable
     /// <summary>没选中任何通道时，为什么。</summary>
     public string? UnavailableReason => unavailableReason;
 
-    /// <summary>挑一条能用的通道。挑不到就如实说第一条不可用的理由。</summary>
+    /// <summary>
+    /// **二级路由**：在一级路由排好的候选里，逐条问它的识别依据命中没有。
+    ///
+    /// 各家的识别依据互不重叠（固件接口的 GUID、固件指纹），所以一台机器
+    /// 最多命中一条 —— 这里的先后只决定"先问谁"，不决定答案。
+    /// 一条都不命中就如实把每条的理由摆出来，而不是笼统说一句用不了。
+    /// </summary>
     public bool Open()
     {
         if (active is not null)

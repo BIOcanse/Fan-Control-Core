@@ -174,7 +174,7 @@ public sealed class AsusWmiFanBackend : IFanBackend
     }
 
     /// <summary>读一项状态。固件说这一项不存在时返回 null，不返回 0。</summary>
-    private uint? ReadStatus(uint device)
+    private ulong? ReadStatus(uint device)
         => wmi.InvokeOrdered(ReadMethod, device) is { } raw && (raw & PresenceBit) != 0
             ? raw & DataMask
             : null;
