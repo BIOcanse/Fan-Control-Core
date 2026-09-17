@@ -178,37 +178,20 @@ public sealed class UniwillWmiFanBackend : IFanBackend
     }
 
     private bool SetBit(ushort address, byte bit, out string? failureReason)
-    {
-        if (transport.Read(address) is not { } current)
-        {
-            failureReason = $"读不到 0x{address:X4}。";
-            return false;
-        }
-        var wanted = (byte)(current | bit);
-        if (current != wanted && !transport.WriteWithRetry(address, wanted))
-        {
-            failureReason = $"写不了 0x{address:X4}。";
-            return false;
-        }
-        failureReason = null;
-        return true;
-    }
+        => WriteBit(address, bit, set: true, out failureReason);
 
     private bool ClearBit(ushort address, byte bit, out string? failureReason)
+        => WriteBit(address, bit, set: false, out failureReason);
+
+    private bool WriteBit(ushort address, byte bit, bool set, out string? failureReason)
     {
-        if (transport.Read(address) is not { } current)
+        if (transport.WriteBit(address, bit, set))
         {
-            failureReason = $"读不到 0x{address:X4}。";
-            return false;
+            failureReason = null;
+            return true;
         }
-        var wanted = (byte)(current & ~bit);
-        if (current != wanted && !transport.WriteWithRetry(address, wanted))
-        {
-            failureReason = $"写不了 0x{address:X4}。";
-            return false;
-        }
-        failureReason = null;
-        return true;
+        failureReason = $"改不了 0x{address:X4} 的第 0x{bit:X2} 位。";
+        return false;
     }
 
     private bool ClearFullFanMode(out string? failureReason)
@@ -224,13 +207,10 @@ public sealed class UniwillWmiFanBackend : IFanBackend
         {
             return false;
         }
-        if (transport.Read(UniwillFanProfileTable.FanModeRegister) is not { } mode)
-        {
-            failureReason = "读不到风扇模式。";
-            return false;
-        }
-        var wanted = (byte)(mode | UniwillFanProfileTable.FullFanModeBit);
-        if (mode != wanted && !transport.Write(UniwillFanProfileTable.FanModeRegister, wanted))
+        if (!transport.WriteBit(
+                UniwillFanProfileTable.FanModeRegister,
+                UniwillFanProfileTable.FullFanModeBit,
+                set: true))
         {
             failureReason = "切不到全速模式。";
             return false;
@@ -245,15 +225,11 @@ public sealed class UniwillWmiFanBackend : IFanBackend
         {
             return false;
         }
-        if (transport.Read(UniwillFanProfileTable.FanModeRegister) is not { } mode)
-        {
-            failureReason = "读不到风扇模式。";
-            return false;
-        }
-
         // 清掉全速模式位。**这个位是整机共用的**，所以两个风扇一起回到自动。
-        var wanted = (byte)(mode & ~UniwillFanProfileTable.FullFanModeBit);
-        if (mode != wanted && !transport.Write(UniwillFanProfileTable.FanModeRegister, wanted))
+        if (!transport.WriteBit(
+                UniwillFanProfileTable.FanModeRegister,
+                UniwillFanProfileTable.FullFanModeBit,
+                set: false))
         {
             failureReason = "交还固件自动控制失败。";
             return false;
