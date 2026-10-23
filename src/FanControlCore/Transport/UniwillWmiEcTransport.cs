@@ -19,7 +19,7 @@ namespace FanControlCore.Transport;
 /// Uniwill 复用了微软 ACPI 示例 MOF 的 GUID，所以类名看着毫不相干。
 /// </summary>
 [SupportedOSPlatform("windows")]
-public sealed class UniwillWmiEcTransport : IDisposable
+public sealed class UniwillWmiEcTransport : IUniwillFanHardware
 {
     private const string Scope = @"root\WMI";
     private const string ClassName = "AcpiTest_MULong";

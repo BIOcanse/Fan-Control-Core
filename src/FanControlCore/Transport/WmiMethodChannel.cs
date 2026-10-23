@@ -175,6 +175,130 @@ public sealed class WmiMethodChannel : IDisposable
     public ulong? InvokeOrderedByMethodId(int methodId, params ulong[] arguments)
         => MethodNameById(methodId) is { } name ? InvokeOrdered(name, arguments) : null;
 
+    /// <summary>
+    /// 按位置调一次方法，拿回第一个**缓冲区**出参。
+    ///
+    /// 有的厂商（联想的风扇表就是）不回一个整数，而是回一段字节 ——
+    /// 表的内容在里面。名字照旧不猜：出参里第一个数组就是它。
+    /// </summary>
+    public byte[]? InvokeOrderedForBuffer(string methodName, params ulong[] arguments)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(methodName);
+        ArgumentNullException.ThrowIfNull(arguments);
+        lock (gate)
+        {
+            if (Resolve() is not { } target)
+            {
+                return null;
+            }
+            try
+            {
+                using var parameters = target.GetMethodParameters(methodName);
+                var ordered = InParametersByPosition(parameters);
+                if (ordered.Count < arguments.Length)
+                {
+                    return null;
+                }
+                for (var index = 0; index < arguments.Length; index++)
+                {
+                    parameters[ordered[index]] = Fit(parameters, ordered[index], arguments[index]);
+                }
+                using var result = target.InvokeMethod(methodName, parameters, null);
+                return FirstBufferValue(result);
+            }
+            catch (Exception error) when (error is ManagementException
+                or UnauthorizedAccessException
+                or InvalidOperationException)
+            {
+                Forget();
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 按位置调一次方法，其中一个入参是**缓冲区**。
+    ///
+    /// 缓冲区塞进第一个数组型入参，其余标量按位置填进剩下的。这样
+    /// "只收一段缓冲"和"收几个标量再加一段缓冲"两种形状都成立 ——
+    /// 各家的方法签名不一样，而我们手上没有那些机器去一一验证。
+    ///
+    /// 返回的是**调用本身有没有走通**；写进去算不算数不由它回答，那要回读核对。
+    /// </summary>
+    public bool InvokeOrderedWithBuffer(
+        string methodName,
+        byte[] payload,
+        params ulong[] arguments)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(methodName);
+        ArgumentNullException.ThrowIfNull(payload);
+        ArgumentNullException.ThrowIfNull(arguments);
+        lock (gate)
+        {
+            if (Resolve() is not { } target)
+            {
+                return false;
+            }
+            try
+            {
+                using var parameters = target.GetMethodParameters(methodName);
+                string? bufferName = null;
+                var scalars = new List<string>();
+                foreach (var name in InParametersByPosition(parameters))
+                {
+                    if (bufferName is null && parameters.Properties[name].IsArray)
+                    {
+                        bufferName = name;
+                        continue;
+                    }
+                    scalars.Add(name);
+                }
+                if (bufferName is null || scalars.Count < arguments.Length)
+                {
+                    // 没有缓冲区入参，或者标量位子不够：协议对不上，宁可不调。
+                    return false;
+                }
+                for (var index = 0; index < arguments.Length; index++)
+                {
+                    parameters[scalars[index]] = Fit(parameters, scalars[index], arguments[index]);
+                }
+                parameters[bufferName] = payload;
+                using var result = target.InvokeMethod(methodName, parameters, null);
+                return result is not null;
+            }
+            catch (Exception error) when (error is ManagementException
+                or UnauthorizedAccessException
+                or InvalidOperationException)
+            {
+                Forget();
+                return false;
+            }
+        }
+    }
+
+    /// <summary>出参里第一个字节数组。没有就是这个方法不回缓冲区。</summary>
+    private static byte[]? FirstBufferValue(ManagementBaseObject? result)
+    {
+        if (result is null)
+        {
+            return null;
+        }
+        foreach (var property in result.Properties)
+        {
+            switch (property.Value)
+            {
+                case byte[] bytes:
+                    return bytes;
+                // 有的驱动把 uint8[] 报成更宽的整数数组。照样收下，逐个截回字节。
+                case ushort[] words:
+                    return [.. words.Select(static value => (byte)value)];
+                case uint[] longs:
+                    return [.. longs.Select(static value => (byte)value)];
+            }
+        }
+        return null;
+    }
+
     /// <summary>这个类里 <c>WmiMethodId</c> 等于这个编号的方法叫什么。找不到就是没有。</summary>
     private string? MethodNameById(int methodId)
     {

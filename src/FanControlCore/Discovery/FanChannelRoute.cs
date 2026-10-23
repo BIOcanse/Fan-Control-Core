@@ -20,6 +20,15 @@ public enum FanChannelCategory
     /// <summary>内核已经把风扇导出成标准属性。Linux 上有就用它，不必知道是什么品牌。</summary>
     Hwmon,
 
+    /// <summary>
+    /// 主板上的 Super I/O（Nuvoton / ITE / Fintek / Winbond）。台式机的主路径。
+    ///
+    /// **排在厂商固件之前**：台式机上根本没有"厂商风扇固件接口"这回事，
+    /// 而笔记本上又枚举不到可写的 Super I/O 接头 —— 两边天然不重叠，
+    /// 谁在前不影响结果。放前面是因为台式机上它才是那条正路。
+    /// </summary>
+    SuperIo,
+
     /// <summary>厂商固件自己暴露的 WMI / ACPI 方法。Windows 上的主路径。</summary>
     VendorFirmware,
 
@@ -98,6 +107,16 @@ public sealed record FanChannelRoute(
         [
             // 厂商固件接口。识别依据都是各家固件自己的 WMI 接口在不在 ——
             // GUID 是固件里写死的，各家互不重叠，所以最多命中一条。
+            /*
+             * 台式主板的风扇接头。**一级路由键是控制器芯片，不是主板品牌** ——
+             * 华硕/微星/技嘉的台式板绝大多数都是那几颗 Super I/O，
+             * 按品牌分只会把同一件事写好几遍。
+             *
+             * 识别依据：能不能枚举到可写的接头。笔记本上枚举不到（风扇在整机 EC 上），
+             * 所以它和下面那几条笔记本通道天然不重叠。
+             */
+            new(FanChannelCategory.SuperIo, static () => new DesktopSuperIoFanBackend()),
+
             new(FanChannelCategory.VendorFirmware, static () => new AsusWmiFanBackend()),
             new(FanChannelCategory.VendorFirmware, static () => new HpWmiFanBackend()),
             new(FanChannelCategory.VendorFirmware, static () => new LenovoWmiFanBackend()),

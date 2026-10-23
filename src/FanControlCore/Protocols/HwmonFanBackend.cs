@@ -78,7 +78,14 @@ public sealed class HwmonFanBackend : IFanBackend
         {
             var fan = fans[index];
             var writable = fan.DutyPath is not null && CanWrite(fan.DutyPath);
-            descriptions.Add(new FanDescription(index, fan.Name, writable, writable));
+            descriptions.Add(new FanDescription(
+                index,
+                fan.Name,
+                writable,
+                writable,
+                // 内核把 pwm 导出成可写属性，那就是一个标准的固定占空比执行器，
+                // 曲线由我们自己跑。写不了的就是只读。
+                SupportsSoftwareCurve: writable));
         }
         return descriptions;
     }

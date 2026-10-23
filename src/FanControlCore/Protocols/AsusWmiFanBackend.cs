@@ -50,17 +50,24 @@ public sealed class AsusWmiFanBackend : IFanBackend
     private const uint FanModeFullSpeed = 1;
 
     /// <summary>这台机器上认出来的风扇，按设备 ID 排好。</summary>
-    private readonly List<(uint Device, string Name)> fans = [];
+    private readonly List<(uint Device, string Name, string Role)> fans = [];
 
     private readonly WmiMethodChannel wmi = new(Scope, ClassName);
     private bool disposed;
 
-    /// <summary>候选风扇。哪几个真的在，由固件的"存在位"回答。</summary>
-    private static readonly (uint Device, string Name)[] CandidateFans =
+    /// <summary>
+    /// 候选风扇。哪几个真的在，由固件的"存在位"回答。
+    ///
+    /// **角色跟着设备 ID 走**：这两个 ID 在华硕这条链路上就是 CPU 和显卡侧，
+    /// 认得出来就照实报，上层拿它当词条。
+    /// 第三个"中央风扇"各机型吹的东西不一样（有的压 VRM，有的只是中置排风），
+    /// **认不出就不挂** —— 挂一个猜的角色会让用户按它去调，调的却是另一把。
+    /// </summary>
+    private static readonly (uint Device, string Name, string Role)[] CandidateFans =
     [
-        (0x0011_0013, "CPU 风扇"),
-        (0x0011_0014, "显卡风扇"),
-        (0x0011_0031, "中央风扇")
+        (0x0011_0013, "CPU 风扇", FanRoles.Cpu),
+        (0x0011_0014, "显卡风扇", FanRoles.Gpu),
+        (0x0011_0031, "中央风扇", FanRoles.Unknown)
     ];
 
     public string Name => "asus-atk-wmi";
@@ -110,7 +117,19 @@ public sealed class AsusWmiFanBackend : IFanBackend
                 Writable: true,
                 // ASUS 的任意占空比走另一套八点曲线表，不是"设一个占空比"。
                 // 没有机器验证之前不声称支持。
-                SupportsDuty: false));
+                SupportsDuty: false,
+                Role: fans[index].Role,
+                /*
+                 * **这条链路有真正的固件曲线：8 个温度点 + 8 个转速点**
+                 * （payload 固定 16 字节，CPU / GPU / 中置风扇各一个入口，
+                 * 还能写升降温滞回）。
+                 *
+                 * 但传输层还没接，所以这里如实报 preset —— 现在能做的
+                 * 确实只有切模式。**不能先声明再说**：声明了界面就会给出
+                 * 一个拖得动却写不下去的曲线图。接上之后改成 FirmwareXy，
+                 * 并把 CurvePoints 填 8。
+                 */
+                SupportsSoftwareCurve: false));
         }
         return descriptions;
     }

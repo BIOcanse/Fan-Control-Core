@@ -1,3 +1,4 @@
+using FanControlCore.Policy;
 using FanControlCore.Protocols;
 
 namespace FanControlCore.Discovery;
@@ -39,6 +40,12 @@ public sealed class FanCore : IDisposable
         }
     }
 
+    /// <summary>Explicit backend selection for embedding and isolated testing.</summary>
+    public FanCore(IFanBackend backend)
+    {
+        candidates.Add(backend ?? throw new ArgumentNullException(nameof(backend)));
+    }
+
     /// <summary>选中的通道叫什么。还没选中就是 null。</summary>
     public string? ActiveBackendName => active?.Name;
 
@@ -77,12 +84,23 @@ public sealed class FanCore : IDisposable
         return false;
     }
 
-    /// <summary>有几个风扇、各自能做什么。不碰硬件。</summary>
-    public IReadOnlyList<FanDescription> Describe()
-        => active?.Describe() ?? [];
+    /// <summary>返回已探测能力；显式刷新才重新探测，不改变设定或所有权。</summary>
+    public IReadOnlyList<FanDescription> Describe(bool refresh = false)
+    {
+        if (refresh)
+        {
+            if (active is null) Open();
+            else active.RefreshDetection();
+        }
+        return active?.Describe() ?? [];
+    }
 
     public IReadOnlyList<FanState> Read()
         => active?.Read() ?? [];
+
+    /// <summary>这个风扇现在跑的曲线。读不到、或者这条通道没有曲线，就是 null。</summary>
+    public IReadOnlyList<FanCurvePoint>? ReadCurve(int fanIndex)
+        => engine?.ActiveCurve(fanIndex) ?? active?.ReadCurve(fanIndex);
 
     public bool TrySetDuty(int fanIndex, double percent, out string? failureReason)
     {
@@ -91,8 +109,10 @@ public sealed class FanCore : IDisposable
             failureReason = unavailableReason ?? "没有可用的风扇通道。";
             return false;
         }
+        if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
         if (!active.TrySetDuty(fanIndex, percent, out failureReason))
         {
+            if (active.HasPendingTemporaryRestore(fanIndex)) overridden.Add(fanIndex);
             return false;
         }
         // 记下来，退出时要交还固件。
@@ -108,6 +128,7 @@ public sealed class FanCore : IDisposable
             failureReason = unavailableReason ?? "没有可用的风扇通道。";
             return false;
         }
+        if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
         if (!active.TrySetFullSpeed(fanIndex, out failureReason))
         {
             return false;
@@ -116,20 +137,166 @@ public sealed class FanCore : IDisposable
         return true;
     }
 
-    public bool TrySetAutomatic(int fanIndex, out string? failureReason)
+    public bool TrySetAutomatic(int fanIndex, out string? failureReason, bool resetFirmwareCurve = false)
     {
         if (active is null)
         {
             failureReason = unavailableReason ?? "没有可用的风扇通道。";
             return false;
         }
-        if (!active.TrySetAutomatic(fanIndex, out failureReason))
+        if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
+        if (!(resetFirmwareCurve ? active.TryResetFirmwareCurve(fanIndex, out failureReason)
+            : active.TrySetAutomatic(fanIndex, out failureReason)))
         {
             return false;
         }
         overridden.Remove(fanIndex);
         return true;
     }
+
+    /// <summary>宿主推过来的温度。软件曲线要用，固件曲线用不上。</summary>
+    public FanTemperatureStore Temperatures { get; } = new();
+
+    /// <summary>
+    /// 这台机器的软件曲线要不要宿主推温度。
+    ///
+    /// 走固件曲线的机器**一次都不用推** —— 曲线交给固件之后就不需要我们参与了。
+    /// 宿主据此决定要不要起那条 0.1 秒的订阅，不做无用功。
+    /// </summary>
+    public bool NeedsTemperatures
+        => Describe().Any(fan => fan.SupportsSoftwareCurve);
+
+    /// <summary>
+    /// 把一条曲线交给这个风扇。**走哪条路由这条通道的能力决定。**
+    ///
+    /// <list type="bullet">
+    /// <item><b>固件曲线</b>（fw-xy / fw-table）：写进固件的表，之后固件自己执行。
+    ///   写完**不记进 <c>overridden</c>、退出时也不撤销** —— 这正是它和定速的
+    ///   根本区别：定速是我们在替固件管风扇，人走了必须还回去；曲线是改固件自己
+    ///   查的那张表，写进去就该一直算数，重启也还在。退出时偷偷改回去，
+    ///   等于用户设的东西悄悄失效。</item>
+    /// <item><b>软件曲线</b>（sw-curve）：底层只能设固定转速，所以曲线由
+    ///   <see cref="SoftwareCurveEngine"/> 在这里跑。它**要记进 overridden**，
+    ///   因为风扇确实被我们按着，退出必须交还。</item>
+    /// </list>
+    ///
+    /// 界面上"固件跑曲线 / 软件跑曲线"那个词条，说的就是这两者的区别。
+    /// </summary>
+    public bool TryWriteCurve(
+        int fanIndex,
+        IReadOnlyList<FanCurvePoint> curve,
+        string? execution,
+        out string? failureReason)
+    {
+        if (active is null)
+        {
+            failureReason = unavailableReason ?? "没有可用的风扇通道。";
+            return false;
+        }
+
+        var described = Describe().FirstOrDefault(fan => fan.Index == fanIndex);
+        if (described is null)
+        {
+            failureReason = "没有这个风扇。";
+            return false;
+        }
+
+        /*
+         * **交给谁执行是用户选的。** 没选就默认固件 —— 固件那条路写一次就一直有效，
+         * 本程序关了、重启了都还在，那是更好的默认；软件那条得我们一直跑着。
+         *
+         * 选了这台机器给不了的那一条，**如实说，不悄悄换成另一条**：
+         * 悄悄换掉的话，用户以为曲线会一直有效，实际关掉程序就没了。
+         */
+        var wanted = execution ?? (described.FirmwareCurve is not null
+            ? FanCurveExecutions.Firmware
+            : FanCurveExecutions.Software);
+
+        if (wanted == FanCurveExecutions.Firmware)
+        {
+            if (described.FirmwareCurve is null)
+            {
+                failureReason = "这条通道没有固件曲线，只能由软件接管。";
+                return false;
+            }
+            // 固件接手了，我们之前挂的软件曲线就该撤掉，否则两边抢同一把风扇。
+            if (engine?.IsRunning(fanIndex) == true && !engine.TryStop(fanIndex, out failureReason)) return false;
+            if (!active.TryWriteCurve(fanIndex, curve, out failureReason))
+            {
+                if (active.HasPendingTemporaryRestore(fanIndex)) overridden.Add(fanIndex);
+                return false;
+            }
+            overridden.Remove(fanIndex);
+            return true;
+        }
+
+        if (!described.SupportsSoftwareCurve)
+        {
+            failureReason = "这条通道给不了固定转速，软件曲线跑不起来。";
+            return false;
+        }
+
+        /*
+         * 软件曲线。温度源只有宿主推来的那些 —— 这个核心自己没有传感器，
+         * 也不该去长一套：宿主本来就有完整的监控栈。
+         *
+         * 看哪些温度按**风扇角色**定：显卡风扇只看显卡，CPU 风扇只看 CPU，
+         * 认不出角色的就看全部、取最热的那一个 ——
+         * 共用散热的笔记本上，按最吃紧的那一路走才是对的。
+         */
+        var names = Temperatures.Names
+            .Where(name => described.Role switch
+            {
+                FanRoles.Gpu => name.StartsWith("gpu", StringComparison.OrdinalIgnoreCase),
+                FanRoles.Cpu => name.StartsWith("cpu", StringComparison.OrdinalIgnoreCase),
+                _ => true
+            })
+            .ToArray();
+        if (names.Length == 0 || (described.Role != FanRoles.Gpu
+            && !names.Any(name => name.StartsWith("cpu", StringComparison.OrdinalIgnoreCase))))
+        {
+            // 宿主还没推过温度，或者推来的里面没有这把风扇该看的那一路。
+            // **不拿别的温度顶上** —— 按错的温度调速比不调更糟。
+            failureReason = "还没有收到这个风扇要看的温度，软件曲线跑不起来。";
+            return false;
+        }
+
+        engine ??= new SoftwareCurveEngine(active);
+        var plan = new SoftwareCurvePlan(
+            fanIndex,
+            curve,
+            [.. names.Select(name => new FanTemperatureSource(
+                name,
+                () => Temperatures.Read(name),
+                Required: described.Role != FanRoles.Gpu && name.StartsWith("cpu", StringComparison.OrdinalIgnoreCase)))]);
+        if (!engine.TryStart(plan, out failureReason))
+        {
+            return false;
+        }
+        // 风扇现在归我们按着，退出必须交还。
+        overridden.Add(fanIndex);
+        return true;
+    }
+
+    /// <summary>
+    /// 这个风扇的曲线现在归谁执行。没有在跑的曲线就是 null。
+    ///
+    /// **以实际状态为准，不是以用户选了什么为准。** 软件曲线在引擎里跑着才算软件；
+    /// 引擎因为温度断了而交还固件之后，这里就不再报 software 了 ——
+    /// 界面要能看出"我选的那条现在还在不在跑"。
+    /// </summary>
+    public string? ExecutionOf(int fanIndex)
+    {
+        if (engine?.ActiveCurve(fanIndex) is not null)
+        {
+            return FanCurveExecutions.Software;
+        }
+        return Describe().FirstOrDefault(fan => fan.Index == fanIndex)?.FirmwareCurve is not null
+            ? FanCurveExecutions.Firmware
+            : null;
+    }
+
+    private SoftwareCurveEngine? engine;
 
     /// <summary>
     /// 退出即恢复。
@@ -140,15 +307,23 @@ public sealed class FanCore : IDisposable
     /// </summary>
     public void RestoreAll()
     {
+        // 先把软件曲线停掉再交还：不停的话它下一轮又会写回一个手动值。
+        engine?.StopAll();
         if (active is null)
         {
             return;
         }
         foreach (var fanIndex in overridden.ToArray())
         {
-            active.TrySetAutomatic(fanIndex, out _);
+            try
+            {
+                if (active.TryReleaseOverride(fanIndex, out _)) overridden.Remove(fanIndex);
+            }
+            catch (Exception)
+            {
+                // Keep the failed ownership for retry, and still release the other fans.
+            }
         }
-        overridden.Clear();
     }
 
     public void Dispose()
@@ -158,6 +333,7 @@ public sealed class FanCore : IDisposable
             return;
         }
         disposed = true;
+        engine?.Dispose();
         RestoreAll();
         foreach (var candidate in candidates)
         {

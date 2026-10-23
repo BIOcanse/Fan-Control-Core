@@ -26,6 +26,17 @@ public sealed class UniwillFanProfileTable
     public const ushort SecondFanRpmHigh = 0x046C;
     public const ushort SecondFanRpmLow = 0x046D;
 
+    public const ushort ProjectId = 0x0740;
+
+    /// <summary>
+    /// MECHREVO JIAOLONG Series / 项目 0x1A 的 OEM 地址表和实测使用 0x046B。
+    /// 仅对这个已确认组合修正读数；其他固件保留公开参考的 0x046D。
+    /// </summary>
+    internal static ushort ResolveSecondFanRpmLow(string? manufacturer, string? model, byte? projectId)
+        => string.Equals(manufacturer?.Trim(), "MECHREVO", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(model?.Trim(), "JIAOLONG Series", StringComparison.OrdinalIgnoreCase)
+            && projectId == 0x1A ? (ushort)0x046B : SecondFanRpmLow;
+
     /// <summary>
     /// 当前占空比，读这里。
     ///

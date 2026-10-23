@@ -101,7 +101,25 @@ public sealed class HpWmiFanBackend : IFanBackend
                 index,
                 index == 0 ? "CPU 风扇" : $"风扇 {index + 1}",
                 Writable: true,
-                SupportsDuty: false));
+                SupportsDuty: false,
+                /*
+                 * **这里不报角色。**
+                 *
+                 * 别家的角色是有出处的编号约定（宏碁 1/4、联想 1/2、华硕按设备 ID），
+                 * HP 这条链路的风扇个数是固件现报的，"0 号就是 CPU 风扇"只是个
+                 * 合理猜测。上面那个名字只进诊断，猜错了没人看见；
+                 * 角色不一样，它会变成界面上的词条 —— 挂一个猜的词条，
+                 * 用户会按它去调，调的却可能是另一把风扇。认不出就不挂。
+                 */
+                /*
+                 * HP 这条链路能设固定转速目标，够跑软件曲线；
+                 * `GET_FAN_TABLE` 只是报能力和范围，**不是可写的固件曲线**。
+                 *
+                 * 固定转速的传输还没接（现在只有全速和自动），所以报 preset。
+                 * 接上之后改 Software，并且 RequiresPeriodicReassert 要置真：
+                 * 这条链路的固件约 120 秒会把控制权收回去。
+                 */
+                SupportsSoftwareCurve: false));
         }
         return descriptions;
     }

@@ -42,11 +42,16 @@ public sealed class AcerWmiFanBackend : IFanBackend
     private const ulong BehaviorFullSpeed = 0x0082_0009;
     private const ulong BehaviorCustom = 0x00C3_0009;
 
-    /// <summary>CPU 风扇是 1，显卡风扇是 4。</summary>
-    private static readonly (uint Id, string Name)[] Fans =
+    /// <summary>
+    /// CPU 风扇是 1，显卡风扇是 4。
+    ///
+    /// **角色跟着这个编号走**，认得出来就照实报上去 ——
+    /// 上层拿它当词条，不报的话界面上只剩"风扇1 / 风扇2"，分不出哪把吹显卡。
+    /// </summary>
+    private static readonly (uint Id, string Name, string Role)[] Fans =
     [
-        (1, "CPU 风扇"),
-        (4, "显卡风扇")
+        (1, "CPU 风扇", FanRoles.Cpu),
+        (4, "显卡风扇", FanRoles.Gpu)
     ];
 
     /// <summary>占空比的硬边界。低于这个值风扇可能转不起来，高于 100 没有意义。</summary>
@@ -97,7 +102,11 @@ public sealed class AcerWmiFanBackend : IFanBackend
                 index,
                 Fans[index].Name,
                 Writable: true,
-                SupportsDuty: true));
+                SupportsDuty: true,
+                Role: Fans[index].Role,
+                // 主线 acer-wmi 对支持 PWM 的机型能独立写 CPU/GPU 0-100%，
+                // 但**没有**通用的固件曲线表接口。所以曲线由我们自己跑。
+                SupportsSoftwareCurve: true, SoftwareTakeoverCoversAllFans: true));
         }
         return descriptions;
     }
